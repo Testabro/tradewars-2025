@@ -1,0 +1,16 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#filter0_f_1_2)">
+    <circle cx="16" cy="16" r="4" fill="#fff7ff"/>
+  </g>
+  <g filter="url(#filter1_f_1_2)">
+    <circle cx="16" cy="16" r="2" fill="#ffb3ff"/>
+  </g>
+  <defs>
+    <filter id="filter0_f_1_2" x="0" y="0" width="32" height="32" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="4"/>
+    </filter>
+    <filter id="filter1_f_1_2" x="10" y="10" width="12" height="12" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="1"/>
+    </filter>
+  </defs>
+</svg>
