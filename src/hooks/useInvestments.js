@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import { getFirestore, doc, updateDoc, runTransaction } from 'firebase/firestore';
+import { getFirestore, doc, runTransaction, increment } from 'firebase/firestore';
 import { 
   validateInvestmentAmount,
   validateInvestmentType,
@@ -45,6 +45,8 @@ export const useInvestments = (user, player, addToLog) => {
       validateInvestmentType(investmentType);
       validateInvestmentEligibility(player, sector, investmentType);
       
+      percentage = Math.round(percentage);
+
       if (percentage <= 0 || percentage > 100) {
         throw new ValidationError('Investment percentage must be between 1 and 100', 'INVALID_PERCENTAGE');
       }
@@ -94,9 +96,13 @@ export const useInvestments = (user, player, addToLog) => {
           [`sectors.${sector.id}.port.${facilityKey}`]: sectorData.port[facilityKey]
         });
         
+        // Read fresh player data inside transaction to avoid stale credits
+        const playerDoc = await transaction.get(playerRef);
+        const fresh = playerDoc.data();
+
         // Update player credits
         transaction.update(playerRef, {
-          credits: player.credits - cost
+          credits: fresh.credits - cost
         });
       });
 
@@ -116,76 +122,92 @@ export const useInvestments = (user, player, addToLog) => {
    */
   const collectRewards = useCallback(async (universe) => {
     try {
-      if (!player.lastRewardCollection) {
-        // First time collecting, set timestamp and return
-        const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-        await updateDoc(playerRef, {
-          lastRewardCollection: Date.now()
-        });
-        return;
-      }
+      const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
 
-      const now = Date.now();
-      const lastCollection = player.lastRewardCollection;
-      const hoursSinceLastCollection = (now - lastCollection) / (1000 * 60 * 60);
-      
-      if (hoursSinceLastCollection < INVESTMENT_CONFIG.PAYOUT_INTERVAL_HOURS) {
-        const remainingTime = Math.ceil((INVESTMENT_CONFIG.PAYOUT_INTERVAL_HOURS - hoursSinceLastCollection) * 60);
-        addToLog(`Next reward collection available in ${remainingTime} minutes`, LOG_TYPES.WARNING);
-        return;
-      }
+      const result = await runTransaction(db, async (transaction) => {
+        // Read fresh player data inside transaction
+        const playerDoc = await transaction.get(playerRef);
+        const freshPlayer = playerDoc.data();
 
-      let totalRewards = 0;
-      const rewardDetails = [];
-
-      // Calculate rewards from all sectors
-      Object.values(universe.sectors).forEach(sector => {
-        if (!sector.port) return;
-
-        // Trade Post rewards
-        if (sector.port.tradePostInvestments?.[user.uid]) {
-          const ownership = sector.port.tradePostInvestments[user.uid];
-          const reward = calculateHourlyReward(INVESTMENT_TYPES.TRADE_POST, ownership);
-          const hoursToCollect = Math.floor(hoursSinceLastCollection);
-          const totalReward = reward * hoursToCollect;
-          
-          if (totalReward > 0) {
-            totalRewards += totalReward;
-            rewardDetails.push(`Trade Post ${sector.name}: $${totalReward} (${ownership}% ownership)`);
-          }
+        if (!freshPlayer.lastRewardCollection) {
+          // First time collecting, set timestamp and return
+          transaction.update(playerRef, {
+            lastRewardCollection: Date.now()
+          });
+          return { firstTime: true };
         }
 
-        // StarPort rewards
-        if (sector.port.starPortInvestments?.[user.uid]) {
-          const ownership = sector.port.starPortInvestments[user.uid];
-          const reward = calculateHourlyReward(INVESTMENT_TYPES.STARPORT, ownership);
-          const hoursToCollect = Math.floor(hoursSinceLastCollection);
-          const totalReward = reward * hoursToCollect;
-          
-          if (totalReward > 0) {
-            totalRewards += totalReward;
-            rewardDetails.push(`StarPort ${sector.name}: $${totalReward} (${ownership}% ownership)`);
+        const now = Date.now();
+        const lastCollection = freshPlayer.lastRewardCollection;
+        const hoursSinceLastCollection = (now - lastCollection) / (1000 * 60 * 60);
+
+        if (hoursSinceLastCollection < INVESTMENT_CONFIG.PAYOUT_INTERVAL_HOURS) {
+          const remainingTime = Math.ceil((INVESTMENT_CONFIG.PAYOUT_INTERVAL_HOURS - hoursSinceLastCollection) * 60);
+          return { cooldown: true, remainingTime };
+        }
+
+        let totalRewards = 0;
+        const rewardDetails = [];
+
+        // Calculate rewards from all sectors
+        Object.values(universe.sectors).forEach(sector => {
+          if (!sector.port) return;
+
+          // Trade Post rewards
+          if (sector.port.tradePostInvestments?.[user.uid]) {
+            const ownership = sector.port.tradePostInvestments[user.uid];
+            const reward = calculateHourlyReward(INVESTMENT_TYPES.TRADE_POST, ownership);
+            const hoursToCollect = Math.floor(hoursSinceLastCollection);
+            const totalReward = reward * hoursToCollect;
+
+            if (totalReward > 0) {
+              totalRewards += totalReward;
+              rewardDetails.push(`Trade Post ${sector.name}: $${totalReward} (${ownership}% ownership)`);
+            }
           }
+
+          // StarPort rewards
+          if (sector.port.starPortInvestments?.[user.uid]) {
+            const ownership = sector.port.starPortInvestments[user.uid];
+            const reward = calculateHourlyReward(INVESTMENT_TYPES.STARPORT, ownership);
+            const hoursToCollect = Math.floor(hoursSinceLastCollection);
+            const totalReward = reward * hoursToCollect;
+
+            if (totalReward > 0) {
+              totalRewards += totalReward;
+              rewardDetails.push(`StarPort ${sector.name}: $${totalReward} (${ownership}% ownership)`);
+            }
+          }
+        });
+
+        if (totalRewards > 0) {
+          transaction.update(playerRef, {
+            credits: freshPlayer.credits + totalRewards,
+            lastRewardCollection: now
+          });
+
+          return { collected: true, totalRewards, rewardDetails };
+        } else {
+          return { noRewards: true };
         }
       });
 
-      if (totalRewards > 0) {
-        const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-        await updateDoc(playerRef, {
-          credits: player.credits + totalRewards,
-          lastRewardCollection: now
-        });
-
-        addToLog(`💰 Investment rewards collected: $${totalRewards}`, LOG_TYPES.SUCCESS);
-        rewardDetails.forEach(detail => addToLog(`  ${detail}`, LOG_TYPES.SUCCESS));
-      } else {
+      // Handle transaction results outside the transaction (logging/UI)
+      if (result.firstTime) {
+        return;
+      } else if (result.cooldown) {
+        addToLog(`Next reward collection available in ${result.remainingTime} minutes`, LOG_TYPES.WARNING);
+      } else if (result.collected) {
+        addToLog(`\u{1F4B0} Investment rewards collected: $${result.totalRewards}`, LOG_TYPES.SUCCESS);
+        result.rewardDetails.forEach(detail => addToLog(`  ${detail}`, LOG_TYPES.SUCCESS));
+      } else if (result.noRewards) {
         addToLog('No investment rewards available', LOG_TYPES.WARNING);
       }
-      
+
     } catch (error) {
       handleError(error, 'Failed to collect rewards');
     }
-  }, [player, user.uid, db, addToLog, handleError]);
+  }, [user.uid, db, addToLog, handleError]);
 
   /**
    * Process trade commission for investors when a trade occurs
@@ -194,7 +216,7 @@ export const useInvestments = (user, player, addToLog) => {
     try {
       if (!sector.port || tradeVolume <= 0) return;
 
-      const updates = {};
+      const commissions = [];
       let totalCommissionPaid = 0;
 
       // Process trade post commissions
@@ -202,27 +224,35 @@ export const useInvestments = (user, player, addToLog) => {
         Object.entries(sector.port.tradePostInvestments).forEach(([playerId, ownership]) => {
           const commission = calculateTradeCommission(tradeVolume, ownership);
           if (commission > 0) {
-            updates[`players.${playerId}.credits`] = commission;
+            commissions.push({ playerId, commission });
             totalCommissionPaid += commission;
           }
         });
       }
 
       // Apply commission updates if any
-      if (Object.keys(updates).length > 0) {
+      if (commissions.length > 0) {
         await runTransaction(db, async (transaction) => {
-          Object.entries(updates).forEach(([path, amount]) => {
-            const [collection, playerId, field] = path.split('.');
+          // Read all player docs first (Firestore requires reads before writes)
+          const playerDocs = await Promise.all(
+            commissions.map(({ playerId }) => {
+              const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, playerId);
+              return transaction.get(playerRef);
+            })
+          );
+
+          // Write updates using increment for atomic credit addition
+          commissions.forEach(({ playerId, commission }) => {
             const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, playerId);
             transaction.update(playerRef, {
-              [field]: amount // This should be increment, but simplified for now
+              credits: increment(commission)
             });
           });
         });
 
         addToLog(`Trade commissions distributed: $${totalCommissionPaid}`, LOG_TYPES.EVENT);
       }
-      
+
     } catch (error) {
       console.error('Failed to process trade commission:', error);
     }

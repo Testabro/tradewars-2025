@@ -233,7 +233,8 @@ export const STARPORT_UPGRADES = {
 export const INVESTMENT_CONFIG = {
   MIN_INVESTMENT: 1000,
   MAX_OWNERSHIP_PERCENTAGE: 100,
-  HOURLY_REWARD_BASE: 50, // Base hourly reward per percentage point
+  HOURLY_REWARD_BASE: 10, // Base hourly reward per percentage point
+  MAX_DAILY_PAYOUT: 5000,
   TRADE_COMMISSION_RATE: 0.05, // 5% of trade volume goes to investors
   INVESTMENT_MULTIPLIERS: {
     TRADE_POST: 1.0,
@@ -280,7 +281,7 @@ export const RANDOM_EVENTS = {
     description: 'You receive a transmission: "Congratulations! Your ship registration won the Galactic Lottery!"',
     probability: 0.02, // 2% chance
     effects: {
-      credits: { min: 5000, max: 25000 }
+      credits: { min: 500, max: 3000 }
     },
     logType: LOG_TYPES.SUCCESS
   },
@@ -433,7 +434,7 @@ export const RANDOM_EVENTS = {
 
 // Event Configuration
 export const EVENT_CONFIG = {
-  BASE_CHANCE_PER_SECTOR: 0.15, // 15% chance per sector jump
+  BASE_CHANCE_PER_SECTOR: 0.10, // 10% chance per sector jump
   COOLDOWN_SECTORS: 3, // Minimum sectors between events
   MAX_EVENTS_PER_SESSION: 5 // Maximum events per play session
 };
@@ -509,7 +510,7 @@ export const PIRATE_TYPES = {
   MARAUDER: {
     name: 'Pirate Marauder',
     hull: 100,
-    shields: 75,
+    shields: 50,
     damage: { min: 15, max: 25 },
     threatLevel: 3,
     loot: {
@@ -523,9 +524,9 @@ export const PIRATE_TYPES = {
   },
   FLAGSHIP: {
     name: 'Pirate Flagship',
-    hull: 150,
-    shields: 100,
-    damage: { min: 20, max: 35 },
+    hull: 120,
+    shields: 75,
+    damage: { min: 20, max: 28 },
     threatLevel: 4,
     loot: {
       credits: { min: 5000, max: 12000 },

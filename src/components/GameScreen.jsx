@@ -99,8 +99,7 @@ function GameScreen({ sector, children }) {
       className={`w-full h-full p-4 bg-neon-dark text-neon-green font-mono border-4 border-neon-purple max-w-6xl mx-auto flex-grow flex flex-col shadow-[0_0_32px_#a259ff] relative game-gradient-bg fade-in rounded-2xl${pulse ? ' game-pulse' : ''}`}
       style={{minHeight: '100vh', background: 'linear-gradient(135deg, #12002a 0%, #2a0a4d 40%, #3a1c71 70%, #00fff7 100%)'}}
     >
-      {/* Audio for sector change */}
-      <audio ref={audioRef} src="/audio/sector-enter.mp3" preload="auto" />
+      {/* Audio handled by useAudioManager hook */}
       {/* Subtle particle effects for special sectors */}
       {specialType && (
         <>

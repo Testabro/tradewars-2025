@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { getFirestore, doc, onSnapshot, collection, getDocs, setDoc, query, writeBatch, updateDoc } from 'firebase/firestore';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { getFirestore, doc, onSnapshot, collection, getDocs, setDoc, query, writeBatch, updateDoc, runTransaction } from 'firebase/firestore';
 
 // Component Imports
 import StatusBar from './StatusBar.jsx';
@@ -41,7 +41,7 @@ import {
   PIRATE_MESSAGES,
   PLANET_CLASSES 
 } from '../constants/gameConstants.js';
-import { getCurrentCargoTotal } from '../utils/gameValidation.js';
+// Validation utilities used by usePlayerActions hook
 import { createFloatingText, createPulsingGlow, createScreenShake, createParticleEffect } from '../utils/animations.js';
 
 export default function Game({ user, player, onSignOut }) {
@@ -54,10 +54,14 @@ export default function Game({ user, player, onSignOut }) {
   const [playerAchievements, setPlayerAchievements] = useState([]);
   const [eventHistory, setEventHistory] = useState([]);
   const [pirateEncounter, setPirateEncounter] = useState(null);
+  const warpInputRef = useRef(null);
+  const eventTimeoutRef = useRef(null);
+  const randomEventTimeoutRef = useRef(null);
+  const pirateTimeoutRef = useRef(null);
 
   const db = getFirestore();
   const { log, addToLog } = useGameLog();
-  const playerActions = usePlayerActions(user, player, addToLog);
+  const { moveSector: playerMoveSector, warpToSector: playerWarpToSector, buyFuel, tradeCommodity, purchaseUpgrade, attackShip } = usePlayerActions(user, player, addToLog);
   const investments = useInvestments(user, player, addToLog);
   const { playSound, preloadSounds } = useAudioManager();
 
@@ -76,8 +80,8 @@ export default function Game({ user, player, onSignOut }) {
       handleFuelRecharge();
     }
 
-    // Check for hull destruction and escape pod activation (2% or lower)
-    if (player && (player.hull || 100) <= 2 && !player.escapePodActivated) {
+    // Check for hull destruction and escape pod activation
+    if (player && (player.hull || 100) <= 0 && !player.escapePodActivated) {
       const activateEscapePod = async () => {
         try {
           const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
@@ -112,12 +116,23 @@ export default function Game({ user, player, onSignOut }) {
     const universeSub = onSnapshot(universeRef, (doc) => { if (doc.exists()) setUniverse(doc.data()); });
 
     const playersQuery = query(collection(db, FIREBASE_PATHS.PLAYERS));
-    const playersSub = onSnapshot(playersQuery, s => setShipsInSector(curr => [...s.docs.map(d=>({...d.data(), id: d.id, isNPC: false})).filter(p=>p.id !== user.uid), ...curr.filter(ship=>ship.isNPC)]));
+    const playersSub = onSnapshot(playersQuery, s => {
+      const players = s.docs.map(d => ({ ...d.data(), id: d.id, isNPC: false })).filter(p => p.id !== user.uid);
+      setShipsInSector(curr => [...players, ...curr.filter(ship => ship.isNPC)]);
+    });
 
     const npcsQuery = query(collection(db, FIREBASE_PATHS.NPCS));
-    const npcsSub = onSnapshot(npcsQuery, s => setShipsInSector(curr => [...s.docs.map(d=>({...d.data(), id: d.id, isNPC: true})), ...curr.filter(ship=>!ship.isNPC)]));
+    const npcsSub = onSnapshot(npcsQuery, s => {
+      const npcs = s.docs.map(d => ({ ...d.data(), id: d.id, isNPC: true }));
+      setShipsInSector(curr => [...curr.filter(ship => !ship.isNPC), ...npcs]);
+    });
 
-    return () => { adminSub(); gameStateSub(); universeSub(); playersSub(); npcsSub(); };
+    return () => {
+      adminSub(); gameStateSub(); universeSub(); playersSub(); npcsSub();
+      if (eventTimeoutRef.current) clearTimeout(eventTimeoutRef.current);
+      if (randomEventTimeoutRef.current) clearTimeout(randomEventTimeoutRef.current);
+      if (pirateTimeoutRef.current) clearTimeout(pirateTimeoutRef.current);
+    };
   }, [db, user.uid, player, addToLog]);
 
 
@@ -242,50 +257,29 @@ export default function Game({ user, player, onSignOut }) {
       
       // Show event notification
       setActiveEvent({ ...event, effects: eventLog });
-      setTimeout(() => setActiveEvent(null), 8000); // Clear after 8 seconds
+      if (eventTimeoutRef.current) clearTimeout(eventTimeoutRef.current);
+      eventTimeoutRef.current = setTimeout(() => setActiveEvent(null), 8000);
       
     } catch (error) {
       addToLog(`Event system error: ${error.message}`, LOG_TYPES.WARNING);
     }
   }, [player, universe, user.uid, db, addToLog, playSound, eventHistory]);
 
-  // --- Player Actions ---
+  // --- Player Actions (delegate to hook, add event/pirate triggers) ---
   const moveSector = async (newSector) => {
-  if (!player || newSector < 1 || newSector > (universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT)) return;
-    
-  // Check if player is in escape pod - free movement!
-    const isInEscapePod = (player.hull || 100) <= 2 || player.shipType === 'ESCAPE_POD';
-  const fuelNeeded = isInEscapePod ? 0 : GAME_CONFIG.FUEL_COST_PER_SECTOR;
-    
-    if (!isInEscapePod && player.fuel < fuelNeeded) {
-      addToLog("Insufficient fuel for sector jump!", "warning");
-      return;
-    }
+    if (!player || newSector < 1 || newSector > (universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT)) return;
 
     try {
-  const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      const updates = {
-        currentSector: newSector,
-        fuel: isInEscapePod ? player.fuel : player.fuel - fuelNeeded
-      };
-      
-      await updateDoc(playerRef, updates);
-      
-      if (isInEscapePod) {
-        addToLog(`Emergency thrusters engaged! Drifted to sector ${newSector}. No fuel consumed.`, "success");
-      } else {
-        addToLog(`Jumped to sector ${newSector}. Fuel remaining: ${player.fuel - fuelNeeded}`, "success");
-      }
-      
-      // Trigger random event check
-      setTimeout(() => triggerRandomEvent(), 1000);
-      
-      // Check for pirate encounters
-      setTimeout(() => triggerPirateEncounter(), 1500);
+      await playerMoveSector(newSector);
+      if (randomEventTimeoutRef.current) clearTimeout(randomEventTimeoutRef.current);
+      if (pirateTimeoutRef.current) clearTimeout(pirateTimeoutRef.current);
+      randomEventTimeoutRef.current = setTimeout(() => triggerRandomEvent(), 1000);
+      pirateTimeoutRef.current = setTimeout(() => triggerPirateEncounter(), 1500);
     } catch (error) {
-      addToLog(`Navigation error: ${error.message}`, "warning");
+      // Errors already handled by hook
     }
   };
+
 
   // --- Pirate Encounter System ---
   const triggerPirateEncounter = useCallback(async () => {
@@ -316,13 +310,30 @@ export default function Game({ user, player, onSignOut }) {
     // Roll for encounter
     if (Math.random() > PIRATE_CONFIG.ENCOUNTER_CHANCE) return;
 
-    // Generate pirates
-    const pirateTypes = Object.keys(PIRATE_TYPES);
-    const numPirates = Math.floor(Math.random() * PIRATE_CONFIG.MAX_PIRATES_PER_ENCOUNTER) + 1;
+    // Generate pirates — scale difficulty with player power
+    const playerPower = (player.credits || 0) + ((player.holds || 10) * 100) + ((player.maxShields || 0) * 50);
+    let availablePirateTypes;
+    let maxPirates;
+
+    if (playerPower < 5000) {
+      availablePirateTypes = ['RAIDER'];
+      maxPirates = 1;
+    } else if (playerPower < 20000) {
+      availablePirateTypes = ['RAIDER', 'CORSAIR'];
+      maxPirates = 2;
+    } else if (playerPower < 50000) {
+      availablePirateTypes = ['CORSAIR', 'MARAUDER'];
+      maxPirates = 2;
+    } else {
+      availablePirateTypes = ['MARAUDER', 'FLAGSHIP'];
+      maxPirates = PIRATE_CONFIG.MAX_PIRATES_PER_ENCOUNTER;
+    }
+
+    const numPirates = Math.floor(Math.random() * maxPirates) + 1;
     const pirates = [];
 
     for (let i = 0; i < numPirates; i++) {
-      const pirateTypeKey = pirateTypes[Math.floor(Math.random() * pirateTypes.length)];
+      const pirateTypeKey = availablePirateTypes[Math.floor(Math.random() * availablePirateTypes.length)];
       const pirateTemplate = PIRATE_TYPES[pirateTypeKey];
       
       pirates.push({
@@ -350,24 +361,23 @@ export default function Game({ user, player, onSignOut }) {
 
   const handleCombatEnd = async (result) => {
     if (result === 'DEFEAT') {
-      // Player was defeated - apply penalties
-      const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      const penalties = {
-        hull: Math.max(1, (player.hull || 100) * 0.1), // Leave player with 10% hull
-        credits: Math.max(0, (player.credits || 0) * 0.7), // Lose 30% of credits
-      };
-      
-      // Lose some cargo
-      const cargo = player.cargo || {};
-      const updatedCargo = {};
-      Object.keys(cargo).forEach(commodity => {
-        updatedCargo[`cargo.${commodity}`] = Math.floor(cargo[commodity] * 0.8); // Lose 20% of each commodity
-      });
-
       try {
-        await updateDoc(playerRef, {
-          ...penalties,
-          ...updatedCargo
+        const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
+        await runTransaction(db, async (transaction) => {
+          const playerDoc = await transaction.get(playerRef);
+          const fresh = playerDoc.data();
+
+          const updates = {
+            hull: Math.max(1, (fresh.hull || 100) * 0.1),
+            credits: Math.max(0, (fresh.credits || 0) * 0.7),
+          };
+
+          const cargo = fresh.cargo || {};
+          Object.keys(cargo).forEach(commodity => {
+            updates[`cargo.${commodity}`] = Math.floor(cargo[commodity] * 0.8);
+          });
+
+          transaction.update(playerRef, updates);
         });
         addToLog('Pirates have taken their toll on your ship and cargo!', LOG_TYPES.WARNING);
       } catch (error) {
@@ -381,96 +391,17 @@ export default function Game({ user, player, onSignOut }) {
   const handlePlayerUpdate = async (updates) => {
     try {
       const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      await updateDoc(playerRef, updates);
+      await runTransaction(db, async (transaction) => {
+        const playerDoc = await transaction.get(playerRef);
+        if (!playerDoc.exists()) return;
+        transaction.update(playerRef, updates);
+      });
     } catch (error) {
       addToLog(`Error updating player: ${error.message}`, LOG_TYPES.WARNING);
     }
   };
 
-  const buyFuel = async (amount) => {
-    if (!player || amount <= 0) return;
-    
-    const maxCanBuy = player.maxFuel - player.fuel;
-    const actualAmount = Math.min(amount, maxCanBuy);
-      const cost = actualAmount * GAME_CONFIG.FUEL_PRICE_PER_UNIT;
-    
-    if (player.credits < cost) {
-      addToLog("Insufficient credits for fuel purchase!", "warning");
-      return;
-    }
-
-    try {
-  const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      await updateDoc(playerRef, {
-        fuel: player.fuel + actualAmount,
-        credits: player.credits - cost
-      });
-      addToLog(`Purchased ${actualAmount} fuel units for $${cost}`, "success");
-    } catch (error) {
-      addToLog(`Fuel purchase error: ${error.message}`, "warning");
-    }
-  };
-
-  const tradeCommodity = async (commodityName, type, amount) => {
-    if (!player || !currentSector?.port || amount <= 0) return;
-    
-    const portComm = currentSector.port.commodities[commodityName];
-    if (!portComm) return;
-
-    try {
-  const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      
-      if (type === 'buy') {
-        const cost = portComm.buyPrice * amount;
-        const currentCargoTotal = Object.values(player.cargo || {}).reduce((a, b) => a + b, 0);
-        
-        if (player.credits < cost) {
-          addToLog("Insufficient credits!", "warning");
-          return;
-        }
-        if (currentCargoTotal + amount > player.holds) {
-          addToLog("Insufficient cargo space!", "warning");
-          return;
-        }
-
-        await updateDoc(playerRef, {
-          credits: player.credits - cost,
-          [`cargo.${commodityName}`]: (player.cargo[commodityName] || 0) + amount
-        });
-        playSound('TRADE_SUCCESS');
-        addToLog(`Bought ${amount} ${commodityName} for $${cost}`, "success");
-        
-        // Visual feedback for purchase
-        const tradeButton = document.querySelector(`[data-commodity="${commodityName}"][data-action="buy"]`);
-        if (tradeButton) {
-          createFloatingText(tradeButton, `-$${cost}`, { color: '#ff6b6b', fontSize: '14px' });
-          createParticleEffect(tradeButton, { count: 8, colors: ['#00ff00', '#00ffff'] });
-        }
-      } else if (type === 'sell') {
-        if ((player.cargo[commodityName] || 0) < amount) {
-          addToLog("Insufficient cargo!", "warning");
-          return;
-        }
-
-        const revenue = portComm.sellPrice * amount;
-        await updateDoc(playerRef, {
-          credits: player.credits + revenue,
-          [`cargo.${commodityName}`]: (player.cargo[commodityName] || 0) - amount
-        });
-        playSound('CREDITS_GAIN');
-        addToLog(`Sold ${amount} ${commodityName} for $${revenue}`, "success");
-        
-        // Visual feedback for sale
-        const tradeButton = document.querySelector(`[data-commodity="${commodityName}"][data-action="sell"]`);
-        if (tradeButton) {
-          createFloatingText(tradeButton, `+$${revenue}`, { color: '#00ff00', fontSize: '14px' });
-          createParticleEffect(tradeButton, { count: 12, colors: ['#ffff00', '#00ff00'] });
-        }
-      }
-    } catch (error) {
-      addToLog(`Trade error: ${error.message}`, "warning");
-    }
-  };
+  // buyFuel and tradeCommodity delegated to usePlayerActions hook
 
   const handleAchievementUnlocked = async (achievementId) => {
     try {
@@ -480,205 +411,109 @@ export default function Game({ user, player, onSignOut }) {
         achievements: newAchievements
       });
       setPlayerAchievements(newAchievements);
-      addToLog(`🎉 Achievement unlocked: ${achievementId.replace('_', ' ')}!`, "success");
+      addToLog(`Achievement unlocked: ${achievementId.replace('_', ' ')}!`, LOG_TYPES.SUCCESS);
     } catch (error) {
       console.error('Error saving achievement:', error);
     }
   };
 
-  const purchaseUpgrade = async (upgradeType) => {
-    if (!player || !currentSector?.port?.isStarPort) return;
-    
-    const upgrade = SHIP_UPGRADES[upgradeType];
-    if (!upgrade) return;
-
-    const cost = upgrade.baseCost;
-    if (player.credits < cost) {
-      addToLog("Insufficient credits for upgrade!", "warning");
-      return;
-    }
-
-    try {
-  const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      const updates = { credits: player.credits - cost };
-      
-      if (upgradeType === 'holds') {
-        updates.holds = player.holds + upgrade.increment;
-      } else if (upgradeType === 'shields') {
-        updates.shields = (player.shields || 0) + upgrade.increment;
-        updates.maxShields = (player.maxShields || 0) + upgrade.increment;
-      }
-
-      await updateDoc(playerRef, updates);
-      playSound('TRADE_SUCCESS');
-      addToLog(`Purchased ${upgrade.name} for $${cost}`, "success");
-    } catch (error) {
-      addToLog(`Upgrade error: ${error.message}`, "warning");
-    }
-  };
+  // purchaseUpgrade delegated to usePlayerActions hook
 
   const purchaseShip = async (shipKey, ship) => {
     if (!player || !currentSector?.port?.isShipyard) return;
-    
-    if (player.credits < ship.price) {
-      addToLog("Insufficient credits for ship purchase!", "warning");
-      return;
-    }
 
     try {
       const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      const updates = {
-        credits: player.credits - ship.price,
-        holds: ship.holds,
-        maxFuel: ship.maxFuel,
-        fuel: Math.min(player.fuel, ship.maxFuel), // Don't exceed new max fuel
-        maxShields: ship.maxShields,
-        shields: ship.maxShields, // New ship comes with full shields
-        hull: 100, // New ship has full hull
-        shipType: shipKey,
-        weaponDamage: 15, // All ships start with basic weapons (15 damage)
-        escapePodActivated: false // Reset escape pod status with new ship
-      };
+      await runTransaction(db, async (transaction) => {
+        const playerDoc = await transaction.get(playerRef);
+        const fresh = playerDoc.data();
 
-      await updateDoc(playerRef, updates);
+        if (fresh.credits < ship.price) {
+          throw new Error('Insufficient credits for ship purchase');
+        }
+
+        transaction.update(playerRef, {
+          credits: fresh.credits - ship.price,
+          holds: ship.holds,
+          maxFuel: ship.maxFuel,
+          fuel: Math.min(fresh.fuel, ship.maxFuel),
+          maxShields: ship.maxShields,
+          shields: ship.maxShields,
+          hull: 100,
+          shipType: shipKey,
+          weaponDamage: 15,
+          escapePodActivated: false
+        });
+      });
       playSound('TRADE_SUCCESS');
-      addToLog(`Purchased ${ship.name} for $${ship.price.toLocaleString()}! Your new ship is ready for action.`, "success");
-      
-      // Visual feedback for purchase
-      const shipButton = document.querySelector(`[data-ship="${shipKey}"]`);
-      if (shipButton) {
-        createFloatingText(shipButton, `New Ship!`, { color: '#00ff00', fontSize: '16px' });
-        createParticleEffect(shipButton, { count: 15, colors: ['#00ff00', '#ffff00', '#00ffff'] });
-      }
+      addToLog(`Purchased ${ship.name} for $${ship.price.toLocaleString()}! Your new ship is ready for action.`, LOG_TYPES.SUCCESS);
     } catch (error) {
-      addToLog(`Ship purchase error: ${error.message}`, "warning");
+      addToLog(`Ship purchase error: ${error.message}`, LOG_TYPES.WARNING);
     }
   };
 
   const purchaseService = async (serviceKey, service) => {
     if (!player || !currentSector?.port?.isShipyard) return;
-    
-    if (player.credits < service.price) {
-      addToLog("Insufficient credits for service!", "warning");
-      return;
-    }
-
-    // Check if player has already purchased this service at this shipyard
-    const shipyardId = `sector_${player.currentSector}`;
-    const purchasedServices = player.purchasedServices || {};
-    const shipyardServices = purchasedServices[shipyardId] || [];
-    
-    if (shipyardServices.includes(serviceKey)) {
-      addToLog("You have already purchased this service at this shipyard!", "warning");
-      return;
-    }
 
     try {
       const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      const updates = { credits: player.credits - service.price };
-      
-      // Track the service purchase
-      const newShipyardServices = [...shipyardServices, serviceKey];
-      updates[`purchasedServices.${shipyardId}`] = newShipyardServices;
-      
-      // Apply service effects based on service type
-      switch (serviceKey) {
-        case 'SHIP_REPAIR':
-          updates.hull = 100;
-          addToLog(`Ship repaired to full hull integrity for $${service.price.toLocaleString()}!`, "success");
-          break;
-          
-        case 'SHIELD_REPAIR':
-          updates.shields = player.maxShields || 0;
-          addToLog(`Shields repaired and calibrated for $${service.price.toLocaleString()}!`, "success");
-          break;
-          
-        case 'EMERGENCY_REPAIRS':
-          updates.hull = Math.min(100, (player.hull || 100) + 25);
-          updates.shields = Math.min(player.maxShields || 0, (player.shields || 0) + 10);
-          addToLog(`Emergency repairs completed! +25 hull, +10 shields for $${service.price.toLocaleString()}!`, "success");
-          break;
-          
-        case 'SYSTEM_DIAGNOSTICS':
-          // Provides a small efficiency boost - could restore some fuel or minor hull repair
-          updates.fuel = Math.min(player.maxFuel, (player.fuel || 0) + 10);
-          updates.hull = Math.min(100, (player.hull || 100) + 5);
-          addToLog(`System diagnostics completed! +5% efficiency, +10 fuel, +5 hull for $${service.price.toLocaleString()}!`, "success");
-          break;
-          
-        default:
-          addToLog(`Purchased ${service.name} for $${service.price.toLocaleString()}!`, "success");
-          break;
-      }
+      await runTransaction(db, async (transaction) => {
+        const playerDoc = await transaction.get(playerRef);
+        const fresh = playerDoc.data();
 
-      await updateDoc(playerRef, updates);
+        if (fresh.credits < service.price) {
+          throw new Error('Insufficient credits for service');
+        }
+
+        const shipyardId = `sector_${fresh.currentSector}`;
+        const shipyardServices = fresh.purchasedServices?.[shipyardId] || [];
+
+        if (shipyardServices.includes(serviceKey)) {
+          throw new Error('Already purchased this service at this shipyard');
+        }
+
+        const updates = {
+          credits: fresh.credits - service.price,
+          [`purchasedServices.${shipyardId}`]: [...shipyardServices, serviceKey]
+        };
+
+        switch (serviceKey) {
+          case 'SHIP_REPAIR':
+            updates.hull = 100;
+            break;
+          case 'SHIELD_REPAIR':
+            updates.shields = fresh.maxShields || 0;
+            break;
+          case 'EMERGENCY_REPAIRS':
+            updates.hull = Math.min(100, (fresh.hull || 100) + 25);
+            updates.shields = Math.min(fresh.maxShields || 0, (fresh.shields || 0) + 10);
+            break;
+          case 'SYSTEM_DIAGNOSTICS':
+            updates.fuel = Math.min(fresh.maxFuel, (fresh.fuel || 0) + 10);
+            updates.hull = Math.min(100, (fresh.hull || 100) + 5);
+            break;
+        }
+
+        transaction.update(playerRef, updates);
+      });
+
       playSound('TRADE_SUCCESS');
-      
-      // Visual feedback for purchase
-      const serviceButton = document.querySelector(`[data-service="${serviceKey}"]`);
-      if (serviceButton) {
-        createFloatingText(serviceButton, `Purchased!`, { color: '#00ff00', fontSize: '14px' });
-        createParticleEffect(serviceButton, { count: 10, colors: ['#00ff00', '#00ffff'] });
-      }
+      addToLog(`Purchased ${service.name} for $${service.price.toLocaleString()}!`, LOG_TYPES.SUCCESS);
     } catch (error) {
-      addToLog(`Service purchase error: ${error.message}`, "warning");
+      addToLog(`Service error: ${error.message}`, LOG_TYPES.WARNING);
     }
   };
 
   const warpToSector = async (targetSector) => {
-  if (!player || targetSector < 1 || targetSector > (universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT)) return;
-    
-    // Check if player is in escape pod - free warp!
-    const isInEscapePod = (player.hull || 100) <= 2 || player.shipType === 'ESCAPE_POD';
-  const warpCost = isInEscapePod ? 0 : GAME_CONFIG.FUEL_COST_PER_SECTOR * 3; // Warp costs 3x normal fuel
-    
-    if (!isInEscapePod && player.fuel < warpCost) {
-      addToLog("Insufficient fuel for warp drive!", "warning");
-      return;
-    }
+    if (!player || targetSector < 1 || targetSector > (universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT)) return;
 
     try {
-  const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      const updates = {
-        currentSector: targetSector,
-        fuel: isInEscapePod ? player.fuel : player.fuel - warpCost
-      };
-      
-      await updateDoc(playerRef, updates);
-      
+      await playerWarpToSector(targetSector);
       playSound('WARP_ENGAGE');
-      if (isInEscapePod) {
-        addToLog(`Emergency warp beacon activated! Warped to sector ${targetSector}. No fuel consumed.`, "success");
-      } else {
-        addToLog(`Warp drive engaged! Warped to sector ${targetSector}. Fuel remaining: ${player.fuel - warpCost}`, "success");
-      }
-      
-      // Trigger random event check
-      setTimeout(() => triggerRandomEvent(), 1000);
+      if (randomEventTimeoutRef.current) clearTimeout(randomEventTimeoutRef.current);
+      randomEventTimeoutRef.current = setTimeout(() => triggerRandomEvent(), 1000);
     } catch (error) {
-      addToLog(`Warp drive error: ${error.message}`, "warning");
-    }
-  };
-
-  const attackShip = async (target) => {
-    if (!player || !target) return;
-    
-    const now = Date.now();
-      if (player.lastCombatTimestamp && (now - player.lastCombatTimestamp) < GAME_CONFIG.COMBAT_COOLDOWN) {
-      addToLog("Weapons still charging...", "warning");
-      return;
-    }
-
-    try {
-        const damage = GAME_CONFIG.BASE_WEAPON_DAMAGE + Math.floor(Math.random() * 10);
-      addToLog(`Attacking ${target.name}! Dealt ${damage} damage.`, "combat_self");
-      
-  const playerRef = doc(db, FIREBASE_PATHS.PLAYERS, user.uid);
-      await updateDoc(playerRef, {
-        lastCombatTimestamp: now
-      });
-    } catch (error) {
-      addToLog(`Combat error: ${error.message}`, "warning");
+      // Errors already handled by hook
     }
   };
 
@@ -745,7 +580,7 @@ export default function Game({ user, player, onSignOut }) {
 
       // Log results
       if (shipyardsPlaced < minShipyards || tradingPostsPlaced < minTradingPosts) {
-        addToLog(`Warning: Could only place ${shipyardsPlaced}/${minShipyards} shipyards and ${tradingPostsPlaced}/${minTradingPosts} trading posts due to distance constraints.`, "warning");
+        addToLog(`Warning: Could only place ${shipyardsPlaced}/${minShipyards} shipyards and ${tradingPostsPlaced}/${minTradingPosts} trading posts due to distance constraints.`, LOG_TYPES.WARNING);
       }
 
       // Helper functions for shipyard generation
@@ -914,7 +749,7 @@ export default function Game({ user, player, onSignOut }) {
       
       const universeRef = doc(db, FIREBASE_PATHS.UNIVERSE, DOCUMENT_IDS.UNIVERSE);
       await setDoc(universeRef, { sectors, sectorCount });
-      addToLog(`Universe generated with ${sectorCount} sectors: ${shipyardsPlaced} shipyards, ${tradingPostsPlaced} trading posts, ${planetsGenerated} planets! (Min distance: ${MIN_STATION_DISTANCE} sectors)`, "success");
+      addToLog(`Universe generated with ${sectorCount} sectors: ${shipyardsPlaced} shipyards, ${tradingPostsPlaced} trading posts, ${planetsGenerated} planets! (Min distance: ${MIN_STATION_DISTANCE} sectors)`, LOG_TYPES.SUCCESS);
       
       // Debug log to help identify the issue
       console.log('Universe generation completed:', {
@@ -924,7 +759,7 @@ export default function Game({ user, player, onSignOut }) {
         totalSectorsGenerated: Object.keys(sectors).length
       });
     } catch (error) {
-  addToLog(`Universe generation error: ${error.message}`, "warning");
+  addToLog(`Universe generation error: ${error.message}`, LOG_TYPES.WARNING);
     }
   };
 
@@ -941,9 +776,9 @@ export default function Game({ user, player, onSignOut }) {
       });
       
       await batch.commit();
-      addToLog("Universe reset completed!", "success");
+      addToLog("Universe reset completed!", LOG_TYPES.SUCCESS);
     } catch (error) {
-  addToLog(`Reset error: ${error.message}`, "warning");
+  addToLog(`Reset error: ${error.message}`, LOG_TYPES.WARNING);
     }
   };
 
@@ -958,9 +793,9 @@ export default function Game({ user, player, onSignOut }) {
       await setDoc(gameStateRef, {
         gameEndDate: endDate
       });
-  addToLog(`Game season set to end in ${days} days`, "success");
+  addToLog(`Game season set to end in ${days} days`, LOG_TYPES.SUCCESS);
     } catch (error) {
-  addToLog(`Set end date error: ${error.message}`, "warning");
+  addToLog(`Set end date error: ${error.message}`, LOG_TYPES.WARNING);
     }
   };
 
@@ -1028,7 +863,7 @@ export default function Game({ user, player, onSignOut }) {
                           <td className="text-right">{player.cargo[c.name] || 0}</td>
                           <td className="pl-4">
                             <button 
-                              onClick={() => tradeCommodity(c.name, 'buy', 1)} 
+                              onClick={() => tradeCommodity(c.name, 'buy', 1, currentSector)} 
                               disabled={!canAfford || !hasSpace} 
                               className="text-white hover:text-green-400 disabled:text-gray-600"
                               data-commodity={c.name}
@@ -1037,7 +872,7 @@ export default function Game({ user, player, onSignOut }) {
                               B
                             </button>
                             <button 
-                              onClick={() => tradeCommodity(c.name, 'sell', 1)} 
+                              onClick={() => tradeCommodity(c.name, 'sell', 1, currentSector)} 
                               disabled={(player.cargo[c.name] || 0) <= 0} 
                               className="ml-2 text-white hover:text-green-400 disabled:text-gray-600"
                               data-commodity={c.name}
@@ -1199,11 +1034,12 @@ export default function Game({ user, player, onSignOut }) {
             <div className="mt-4 pt-3 border-t border-cyan-700">
               <h4 className="text-sm font-medium mb-2">WARP DRIVE</h4>
               <div className="flex gap-2 mb-2">
-                <input 
-                  type="number" 
-                  min="1" 
-                  max={universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT} 
-                  placeholder="Sector" 
+                <input
+                  ref={warpInputRef}
+                  type="number"
+                  min="1"
+                  max={universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT}
+                  placeholder="Sector"
                   className="w-20 px-2 py-1.5 text-sm bg-gray-800 border border-cyan-600 text-cyan-400 rounded focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400"
                   onKeyPress={(e) => {
                     if (e.key === 'Enter') {
@@ -1215,9 +1051,10 @@ export default function Game({ user, player, onSignOut }) {
                     }
                   }}
                 />
-                <Button 
+                <Button
                   onClick={() => {
-                    const input = document.querySelector('input[type=\"number\"]');
+                    const input = warpInputRef.current;
+                    if (!input) return;
                     const sector = parseInt(input.value);
                     if (sector >= 1 && sector <= (universe?.sectorCount || GAME_CONFIG.SECTOR_COUNT)) {
                       warpToSector(sector);
@@ -1230,7 +1067,7 @@ export default function Game({ user, player, onSignOut }) {
                 </Button>
               </div>
               <p className="text-xs text-gray-400 mt-1">
-                {(player.hull || 100) <= 2 || player.shipType === 'ESCAPE_POD' ? 'Emergency warp: FREE' : `Cost: ${GAME_CONFIG.FUEL_COST_PER_SECTOR * 3} fuel`}
+                {(player.hull || 100) <= 0 || player.shipType === 'ESCAPE_POD' ? 'Emergency warp: FREE' : `Cost: ${GAME_CONFIG.FUEL_COST_PER_SECTOR * 3} fuel`}
               </p>
             </div>
           </div>

@@ -127,33 +127,6 @@ function SectorDisplay({ sector }) {
     };
   }, [sector]);
 
-  // Handle interactive clicks with visual feedback
-  const handleImageClick = (e) => {
-    if (imageFrameRef.current) {
-      createFloatingText(imageFrameRef.current, displayName, {
-        color: specialType === 'starport' ? '#00ffff' : 
-               specialType === 'rareplanet' ? '#ff3cff' : '#ffffff',
-        fontSize: '18px',
-        duration: 2500
-      });
-    }
-    setPopover({ type: 'image', x: e.clientX, y: e.clientY, content: displayName });
-  };
-
-  const handleBadgeClick = (e, type, content) => {
-    e.stopPropagation();
-    
-    // Create particle effect on badge click
-    createParticleEffect(e.target, {
-      count: 8,
-      colors: type === 'planet' ? ['#39ff14', '#00ffff'] : ['#00ffff', '#ffffff'],
-      duration: 1500,
-      spread: 60
-    });
-    
-    setPopover({ type, x: e.clientX, y: e.clientY, content });
-  };
-
   if (!sector) return null;
 
   // Priority: Starport > Trading Post > Planet > Asteroid > Nebula > Empty
@@ -219,14 +192,37 @@ function SectorDisplay({ sector }) {
     infoColor = 'text-purple-100';
   }
 
+  // Handle interactive clicks with visual feedback (declared after displayName/specialType)
+  const handleImageClick = (e) => {
+    if (imageFrameRef.current) {
+      createFloatingText(imageFrameRef.current, displayName, {
+        color: specialType === 'starport' ? '#00ffff' :
+               specialType === 'rareplanet' ? '#ff3cff' : '#ffffff',
+        fontSize: '18px',
+        duration: 2500
+      });
+    }
+    setPopover({ type: 'image', x: e.clientX, y: e.clientY, content: displayName });
+  };
+
+  const handleBadgeClick = (e, type, content) => {
+    e.stopPropagation();
+    createParticleEffect(e.target, {
+      count: 8,
+      colors: type === 'planet' ? ['#39ff14', '#00ffff'] : ['#00ffff', '#ffffff'],
+      duration: 1500,
+      spread: 60
+    });
+    setPopover({ type, x: e.clientX, y: e.clientY, content });
+  };
+
   return (
     <div
       ref={containerRef}
       className={`relative border-4 border-neon-purple px-3 py-4 sm:px-8 sm:py-8 md:px-14 md:py-10 text-neon-purple font-mono text-xs text-center mb-6 rounded-2xl shadow-2xl overflow-hidden sector-gradient-bg fade-in max-w-2xl mx-auto ${pulse ? 'sector-pulse' : ''}`}
       style={{ minHeight: 280, maxWidth: '98vw', background: 'linear-gradient(135deg, #12002a 0%, #2a0a4d 40%, #3a1c71 70%, #00fff7 100%)' }}
     >
-      {/* Audio for sector enter */}
-      <audio ref={audioRef} src="/audio/sector-enter.mp3" preload="auto" />
+      {/* Audio handled by useAudioManager hook */}
       {/* Animated gradient background */}
       <div className="absolute inset-0 z-0 sector-gradient-bg" aria-hidden="true" style={{background: 'linear-gradient(135deg, #12002a 0%, #2a0a4d 40%, #3a1c71 70%, #00fff7 100%)', opacity: 0.92}}></div>
       {/* Glowing border overlay */}

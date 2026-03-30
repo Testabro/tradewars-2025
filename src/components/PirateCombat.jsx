@@ -1,13 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Button from './Button.jsx';
-
-const LOOT_RANGES = {
-  'Pirate Scout': { min: 50, max: 150 },
-  'Pirate Raider': { min: 100, max: 300 },
-  'Pirate Destroyer': { min: 200, max: 500 },
-  'Pirate Interceptor': { min: 75, max: 200 },
-  'Pirate Battleship': { min: 300, max: 800 }
-};
+import { LOG_TYPES } from '../constants/gameConstants.js';
 
 export default function PirateCombat({ 
   pirates = [], 
@@ -56,10 +49,10 @@ export default function PirateCombat({
 
   const generateLoot = useCallback((pirate) => {
     if (!pirate) return { credits: 0 };
-    
-    const range = LOOT_RANGES[pirate.name] || LOOT_RANGES['Pirate Scout'];
+
+    const range = pirate.loot?.credits || { min: 50, max: 150 };
     const credits = Math.floor(Math.random() * (range.max - range.min + 1)) + range.min;
-    
+
     return { credits };
   }, []);
 
@@ -126,8 +119,8 @@ export default function PirateCombat({
       playSound('TRADE_SUCCESS');
     }
     
-    // Calculate player weapon damage (base 15 + random variance)
-    const weaponPower = 15 + Math.floor(Math.random() * 10); // 15-25 damage
+    // Calculate player weapon damage (weaponDamage + random variance)
+    const weaponPower = (player?.weaponDamage || 15) + Math.floor(Math.random() * 10);
     const damage = calculateDamage(weaponPower, currentPirate.armor || 0);
     
     // Damage shields first, then hull
@@ -166,7 +159,7 @@ export default function PirateCombat({
         onPlayerUpdate({
           credits: (player.credits || 0) + loot.credits
         });
-        addToLog(`Combat victory! Gained ${loot.credits} credits from pirate loot.`, 'success');
+        addToLog(`Combat victory! Gained ${loot.credits} credits from pirate loot.`, LOG_TYPES.SUCCESS);
       }
       
       // Check for more pirates
